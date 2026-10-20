@@ -51,41 +51,44 @@ export async function transcribeAudio(audioBuffer, options = {}) {
   const mimeType = inputMime || detectMimeType(audioBuffer);
   const ext = mimeType.includes('wav') ? 'wav' : mimeType.includes('ogg') ? 'ogg' : mimeType.includes('mp3') ? 'mp3' : 'webm';
 
-  // 1. Primary High-Speed ASR: Groq Whisper (whisper-large-v3-turbo)
+  // 1. Primary High-Speed ASR: Groq Whisper models
   if (CONFIG.GROQ_API_KEY) {
-    try {
-      const groq = new Groq({ apiKey: CONFIG.GROQ_API_KEY });
-      const file = await toFile(audioBuffer, `audio.${ext}`, { type: mimeType });
+    const whisperModels = ['whisper-large-v3-turbo', 'whisper-large-v3'];
+    for (const model of whisperModels) {
+      try {
+        const groq = new Groq({ apiKey: CONFIG.GROQ_API_KEY });
+        const file = await toFile(audioBuffer, `audio.${ext}`, { type: mimeType });
 
-      const transcriptionPromise = groq.audio.transcriptions.create({
-        file,
-        model: 'whisper-large-v3-turbo',
-        response_format: 'json',
-        language: language === 'en' ? 'en' : undefined,
-        temperature: 0.0
-      });
+        const transcriptionPromise = groq.audio.transcriptions.create({
+          file,
+          model,
+          response_format: 'json',
+          language: language === 'en' ? 'en' : undefined,
+          temperature: 0.0
+        });
 
-      const timeoutPromise = new Promise((_, reject) =>
-        setTimeout(() => reject(new Error('Groq Whisper timeout')), 5000)
-      );
+        const timeoutPromise = new Promise((_, reject) =>
+          setTimeout(() => reject(new Error(`Groq Whisper (${model}) timeout`)), 5000)
+        );
 
-      const result = await Promise.race([transcriptionPromise, timeoutPromise]);
-      let text = (result?.text || '').trim();
+        const result = await Promise.race([transcriptionPromise, timeoutPromise]);
+        let text = (result?.text || '').trim();
 
-      if (text) {
-        // Check hallucination filter on short audio clips
-        const isHallucination = HALLUCINATION_PATTERNS.some(p => p.test(text));
-        if (isHallucination && audioBuffer.length < 3500) {
-          console.log(`[ASR][${callId}] Filtered Whisper hallucination "${text}"`);
-          return { text: '', latency_ms: Date.now() - t0, is_silence: true, provider: 'groq-whisper' };
+        if (text) {
+          // Check hallucination filter on short audio clips
+          const isHallucination = HALLUCINATION_PATTERNS.some(p => p.test(text));
+          if (isHallucination && audioBuffer.length < 3500) {
+            console.log(`[ASR][${callId}] Filtered Whisper hallucination "${text}"`);
+            return { text: '', latency_ms: Date.now() - t0, is_silence: true, provider: `groq/${model}` };
+          }
+
+          const latency_ms = Date.now() - t0;
+          console.log(`[ASR][${callId}] Groq Whisper (${model}) transcribed in ${latency_ms}ms: "${text}"`);
+          return { text, latency_ms, is_silence: false, provider: `groq/${model}` };
         }
-
-        const latency_ms = Date.now() - t0;
-        console.log(`[ASR][${callId}] Groq Whisper transcribed in ${latency_ms}ms: "${text}"`);
-        return { text, latency_ms, is_silence: false, provider: 'groq-whisper' };
+      } catch (groqErr) {
+        console.warn(`[ASR][${callId}] Groq Whisper (${model}) error:`, groqErr.message);
       }
-    } catch (groqErr) {
-      console.warn(`[ASR][${callId}] Groq Whisper ASR error:`, groqErr.message);
     }
   }
 

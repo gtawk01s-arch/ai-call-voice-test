@@ -56,8 +56,11 @@ function findRequestedExtension(text) {
 
   // Check department keywords if explicit transfer phrasing was used
   const transferPhrases = [
-    'transfer me', 'transfer my call', 'transfer to', 'speak with', 'speak to',
-    'talk to an agent', 'talk to a human', 'representative', 'live agent', 'live person'
+    'transfer', 'transfer me', 'transfer my call', 'transfer to',
+    'connect me', 'connect to', 'put me through', 'put me through to',
+    'route me', 'route to', 'speak with', 'speak to',
+    'talk to an agent', 'talk to a human', 'representative', 'live agent',
+    'live person', 'speak to someone', 'talk to someone'
   ];
   const wantsTransfer = transferPhrases.some(p => lower.includes(p));
   if (wantsTransfer) {

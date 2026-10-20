@@ -114,7 +114,7 @@ async function callGroq(messages, systemInstruction, timeoutMs, callId) {
           model,
           messages: groqMessages,
           temperature: 0.6,
-          max_tokens: 180
+          max_tokens: 350
         }),
         new Promise((_, reject) => setTimeout(() => reject(new Error(`Timeout (${timeoutMs}ms)`)), timeoutMs))
       ]);
@@ -154,11 +154,13 @@ export async function generate(messages, options = {}) {
     callId = 'turn'
   } = options;
 
-  // 1. Try Gemini first (primary multimodal LLM)
-  try {
-    return await callGemini(messages, systemInstruction, timeoutMs, callId);
-  } catch (geminiErr) {
-    console.warn(`[LLM][${callId}] Gemini primary failed, falling back to secondary:`, geminiErr.message);
+  // 1. Try Gemini first if key available
+  if (CONFIG.GEMINI_API_KEY) {
+    try {
+      return await callGemini(messages, systemInstruction, timeoutMs, callId);
+    } catch (geminiErr) {
+      console.warn(`[LLM][${callId}] Gemini primary failed, falling back to secondary:`, geminiErr.message);
+    }
   }
 
   // 2. Try Groq fallback

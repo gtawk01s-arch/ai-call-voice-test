@@ -11,21 +11,21 @@ const ROOT_DIR = path.resolve(__dirname, '..');
 dotenv.config({ path: path.join(ROOT_DIR, '.env'), override: true });
 
 function getGeminiKey() {
-  const k = process.env.GEMINI_API_KEY || '';
-  if (k && k !== 'MY_GEMINI_API_KEY' && k.length > 20) {
-    return k;
+  const k = process.env.GEMINI_API_KEY || process.env.API_KEY || '';
+  if (k && k !== 'MY_GEMINI_API_KEY' && k.length > 10) {
+    return k.trim();
   }
   try {
     const envPath = path.join(ROOT_DIR, '.env');
     if (fs.existsSync(envPath)) {
       const envContent = fs.readFileSync(envPath, 'utf8');
-      const match = envContent.match(/GEMINI_API_KEY=([^\r\n]+)/);
-      if (match && match[1] && match[1].length > 20 && match[1] !== 'MY_GEMINI_API_KEY') {
+      const match = envContent.match(/(?:GEMINI_API_KEY|API_KEY)=([^\r\n]+)/);
+      if (match && match[1] && match[1].length > 10 && match[1] !== 'MY_GEMINI_API_KEY') {
         return match[1].trim();
       }
     }
   } catch (e) {}
-  return k;
+  return k.trim();
 }
 
 function getGroqKey() {
@@ -58,15 +58,14 @@ export const CONFIG = {
 
   // Fallback Models Chain
   GEMINI_MODELS: [
-    'gemini-3.5-flash',
-    'gemini-flash-latest',
     'gemini-3.8-flash',
-    'gemini-3.1-flash-lite'
+    'gemini-3.1-flash-lite',
+    'gemini-flash-latest'
   ],
   GROQ_MODELS: [
-    'llama-3.3-70b-versatile',
-    'llama-3.1-8b-instant',
-    'openai/gpt-oss-120b'
+    'qwen/qwen3.8-27b',
+    'openai/gpt-oss-120b',
+    'openai/gpt-oss-20b'
   ],
 
   // Timeouts (ms)
