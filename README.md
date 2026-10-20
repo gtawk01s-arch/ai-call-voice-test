@@ -259,3 +259,23 @@ npm run dev
 ```
 
 Open `http://localhost:3000` in your browser to access the interactive web interface, dialer simulator, and live PBX dashboard.
+
+---
+
+## 🌐 Deployment Options
+
+### Option 1: Netlify (Frontend Static Host)
+- Build command: `npm run build`
+- Publish directory: `dist`
+- The project includes `netlify.toml` with SPA redirects and microphone permissions configured.
+- When deployed statically on Netlify, the app **automatically activates the Browser Voice Engine**:
+  - Voice output uses the browser's high-fidelity `window.speechSynthesis`.
+  - Microphone transcription uses the browser's native `webkitSpeechRecognition` (Chrome, Edge, Safari, iOS, Android).
+  - Conversation logic runs client-side with full PBX transfer & intent recognition.
+
+### Option 2: Render / Railway / Fly.io / Cloud Run (Full-Stack Node.js Server)
+If you want the full cloud backend running with server-side Groq Whisper, Gemini 3.8 Flash, and Edge TTS audio:
+- **Build command**: `npm run build`
+- **Start command**: `npm start` (runs `tsx server.ts`)
+- **Environment variables**: Add `GEMINI_API_KEY` and `GROQ_API_KEY` in the hosting platform's environment settings.
+

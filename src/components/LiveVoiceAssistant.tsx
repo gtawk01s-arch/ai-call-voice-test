@@ -11,6 +11,7 @@ import {
   isAudioPlaying
 } from '../utils/audio';
 import { MessageItem } from '../types';
+import { generateBrowserVoiceResponse } from '../utils/browserVoiceEngine';
 
 interface LiveVoiceAssistantProps {
   onNavigateToDialer?: () => void;
@@ -53,6 +54,7 @@ export const LiveVoiceAssistant: React.FC<LiveVoiceAssistantProps> = () => {
   const [inputText, setInputText] = useState('');
   const [isSending, setIsSending] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [isStandaloneMode, setIsStandaloneMode] = useState(false);
 
   // Refs for audio handling and timers
   const timerIntervalRef = useRef<any>(null);
@@ -61,6 +63,7 @@ export const LiveVoiceAssistant: React.FC<LiveVoiceAssistantProps> = () => {
   const isHandsfreeRef = useRef(true);
   const isMutedRef = useRef(false);
   const isSpeakerOnRef = useRef(true);
+  const isStandaloneModeRef = useRef(false);
   const currentCallIdRef = useRef(currentCallId);
   const activeMicStreamRef = useRef<MediaStream | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
@@ -84,6 +87,7 @@ export const LiveVoiceAssistant: React.FC<LiveVoiceAssistantProps> = () => {
   useEffect(() => { isHandsfreeRef.current = isHandsfree; }, [isHandsfree]);
   useEffect(() => { isMutedRef.current = isMuted; }, [isMuted]);
   useEffect(() => { isSpeakerOnRef.current = isSpeakerOn; }, [isSpeakerOn]);
+  useEffect(() => { isStandaloneModeRef.current = isStandaloneMode; }, [isStandaloneMode]);
   useEffect(() => { currentCallIdRef.current = currentCallId; }, [currentCallId]);
 
   // Scroll to bottom of conversation
@@ -297,6 +301,173 @@ export const LiveVoiceAssistant: React.FC<LiveVoiceAssistantProps> = () => {
     }).catch(() => {});
   };
 
+  // Handle speech turn locally in browser (for static hosts like Netlify)
+  const handleStandaloneUserTurn = async (userText: string) => {
+    if (isAgentSpeakingRef.current || isCommittingTurnRef.current) return;
+    const clean = userText.trim();
+    if (!clean) return;
+
+    isCommittingTurnRef.current = true;
+    setIsSending(true);
+
+    if (speechRecognitionRef.current) {
+      try {
+        speechRecognitionRef.current.stop();
+      } catch (e) {}
+    }
+
+    if (!isInCallRef.current) {
+      setIsInCall(true);
+      setCallStatus('in-call');
+      setSubtext('Active Call • Browser Voice Engine (Netlify Static Host)');
+      clearInterval(timerIntervalRef.current);
+      timerIntervalRef.current = setInterval(() => {
+        setCallTimerSecs((prev) => prev + 1);
+      }, 1000);
+    }
+
+    // Add user message to conversation
+    const userMsg: MessageItem = {
+      id: `user-${Date.now()}`,
+      type: 'user',
+      text: clean,
+      timestamp: Date.now()
+    };
+    setMessages((prev) => [...prev, userMsg]);
+
+    setAgentWaveState('thinking');
+    setSubtext('Alex is thinking...');
+
+    // Generate intelligent conversational answer in browser
+    const engineRes = generateBrowserVoiceResponse(clean);
+
+    const botMsg: MessageItem = {
+      id: `bot-${Date.now()}`,
+      type: 'bot',
+      text: engineRes.response,
+      audioUrl: null,
+      timestamp: Date.now()
+    };
+
+    setMessages((prev) => {
+      const next = [...prev, botMsg];
+      if (engineRes.action === 'transfer' && engineRes.transfer) {
+        next.push({
+          id: `transfer-${Date.now()}`,
+          type: 'transfer',
+          text: `Call transferred to ${engineRes.transfer.name} (Ext ${engineRes.transfer.extension})`,
+          transfer: engineRes.transfer,
+          timestamp: Date.now()
+        });
+      }
+      return next;
+    });
+
+    isCommittingTurnRef.current = false;
+    setIsSending(false);
+
+    // Speak response aloud via SpeechSynthesis
+    isAgentSpeakingRef.current = true;
+    setAgentWaveState('agent-speaking');
+    setSubtext(`Alex: "${engineRes.response}"`);
+
+    await playVoiceAudio(engineRes.response, null, selectedVoice, isSpeakerOnRef.current);
+
+    agentFinishedSpeakingTimeRef.current = Date.now();
+    isAgentSpeakingRef.current = false;
+    setAgentWaveState('off');
+    setSubtext('Active Live Call • Alex is listening...');
+
+    if (engineRes.action === 'hangup') {
+      setTimeout(() => {
+        endVoiceCall('Call completed');
+      }, 1500);
+      return;
+    }
+
+    // Resume listening
+    if (isInCallRef.current && isStandaloneModeRef.current) {
+      try {
+        speechRecognitionRef.current?.start();
+      } catch (e) {}
+    }
+  };
+
+  // Start browser Web Speech Recognition for standalone static hosting
+  const startBrowserSpeechRecognition = useCallback(() => {
+    const SpeechRec = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+    if (!SpeechRec) {
+      console.warn('Browser SpeechRecognition not supported in this browser.');
+      setMicStatusMsg('Microphone: Browser speech recognition not supported. You can chat below.');
+      setMicStatusColor('text-amber-400');
+      return;
+    }
+
+    try {
+      if (speechRecognitionRef.current) {
+        try {
+          speechRecognitionRef.current.abort();
+        } catch (e) {}
+      }
+
+      const recognition = new SpeechRec();
+      recognition.continuous = true;
+      recognition.interimResults = true;
+      recognition.lang = 'en-US';
+
+      recognition.onstart = () => {
+        console.log('🎙️ Browser speech recognition active');
+        setMicStatusMsg('Microphone: Web Speech Recognition Active 🟢');
+        setMicStatusColor('text-emerald-400');
+      };
+
+      recognition.onresult = (event: any) => {
+        if (isAgentSpeakingRef.current || isCommittingTurnRef.current) return;
+
+        let interim = '';
+        let final = '';
+
+        for (let i = event.resultIndex; i < event.results.length; ++i) {
+          if (event.results[i].isFinal) {
+            final += event.results[i][0].transcript;
+          } else {
+            interim += event.results[i][0].transcript;
+          }
+        }
+
+        if (interim.trim()) {
+          setAgentWaveState('caller-speaking');
+          setSubtext(`Listening: "${interim.trim()}"`);
+        }
+
+        if (final.trim()) {
+          console.log('Heard final speech via browser:', final.trim());
+          handleStandaloneUserTurn(final.trim());
+        }
+      };
+
+      recognition.onerror = (event: any) => {
+        console.warn('Browser speech recognition error:', event.error);
+        if (event.error === 'not-allowed') {
+          setErrorMessage('Microphone access was denied. Please allow microphone in browser site settings.');
+        }
+      };
+
+      recognition.onend = () => {
+        if (isInCallRef.current && isStandaloneModeRef.current && !isAgentSpeakingRef.current) {
+          try {
+            recognition.start();
+          } catch (e) {}
+        }
+      };
+
+      recognition.start();
+      speechRecognitionRef.current = recognition;
+    } catch (err) {
+      console.warn('Failed to start SpeechRecognition:', err);
+    }
+  }, [selectedVoice]);
+
   // Start MediaRecorder audio capture from active mic stream
   const startMediaRecording = (isManualPtt = false) => {
     const stream = activeMicStreamRef.current;
@@ -476,10 +647,12 @@ export const LiveVoiceAssistant: React.FC<LiveVoiceAssistantProps> = () => {
         endVoiceCall('Call completed');
       }
     } catch (err: any) {
-      console.error('Audio turn error:', err);
-      setSubtext('Active Live Call • Speak or type below');
-      setMicStatusMsg('Microphone: Ready • Say something or type below');
-      setMicStatusColor('text-slate-400');
+      console.warn('Audio turn backend unreachable (Netlify static deployment):', err);
+      setIsStandaloneMode(true);
+      startBrowserSpeechRecognition();
+      setSubtext('Active Live Call • Speak anytime (Browser Voice Engine active)');
+      setMicStatusMsg('Microphone: Web Speech Recognition Active 🟢');
+      setMicStatusColor('text-emerald-400');
     } finally {
       clearTimeout(safetyTimeout);
       isCommittingTurnRef.current = false;
@@ -487,10 +660,15 @@ export const LiveVoiceAssistant: React.FC<LiveVoiceAssistantProps> = () => {
     }
   };
 
-  // Commit text turn to backend engine
+  // Commit text turn to backend engine (or fallback to browser engine)
   const commitUserTurn = async (userText: string) => {
     const clean = userText.trim();
     if (!clean) return;
+
+    if (isStandaloneModeRef.current) {
+      await handleStandaloneUserTurn(clean);
+      return;
+    }
 
     unlockAudioContext();
 
@@ -585,17 +763,27 @@ export const LiveVoiceAssistant: React.FC<LiveVoiceAssistantProps> = () => {
         endVoiceCall('Call completed');
       }
     } catch (err: any) {
-      console.error('Turn error:', err);
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: `bot-err-${Date.now()}`,
-          type: 'bot',
-          text: "I heard you, but had a brief connection delay. Please try again or ask me anything else!",
-          timestamp: Date.now()
-        }
-      ]);
+      console.warn('Backend turn error, answering via browser engine:', err);
+      setIsStandaloneMode(true);
+      const engineRes = generateBrowserVoiceResponse(clean);
+      const botMsg: MessageItem = {
+        id: `bot-${Date.now()}`,
+        type: 'bot',
+        text: engineRes.response,
+        audioUrl: null,
+        timestamp: Date.now()
+      };
+      setMessages((prev) => [...prev, botMsg]);
+
+      isAgentSpeakingRef.current = true;
+      setAgentWaveState('agent-speaking');
+      setSubtext(`Alex: "${engineRes.response}"`);
+
+      await playVoiceAudio(engineRes.response, null, selectedVoice, isSpeakerOnRef.current);
+      agentFinishedSpeakingTimeRef.current = Date.now();
+      isAgentSpeakingRef.current = false;
       setAgentWaveState('off');
+      setSubtext('Active Live Call • Alex is listening...');
     } finally {
       clearTimeout(safetyTimeout);
       isCommittingTurnRef.current = false;
@@ -627,17 +815,38 @@ export const LiveVoiceAssistant: React.FC<LiveVoiceAssistantProps> = () => {
       const newCallId = `call-${Date.now()}`;
       setCurrentCallId(newCallId);
 
-      const res = await fetch('/api/dialer/call/start', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          call_id: newCallId,
-          direction: 'inbound',
-          voice: selectedVoice
-        })
-      });
+      let data: any = {
+        greeting: "Hello! I'm Alex, your AI voice assistant. What can I help you with today?",
+        audio_url: null
+      };
+      let isBackendOnline = false;
 
-      const data = await res.json();
+      try {
+        const res = await fetch('/api/dialer/call/start', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            call_id: newCallId,
+            direction: 'inbound',
+            voice: selectedVoice
+          })
+        });
+
+        if (res.ok) {
+          const contentType = res.headers.get('content-type') || '';
+          if (contentType.includes('application/json')) {
+            const json = await res.json();
+            if (json && json.greeting) {
+              data = json;
+              isBackendOnline = true;
+            }
+          }
+        }
+      } catch (backendErr) {
+        console.info('Backend unavailable. Operating in Browser Voice Mode (Netlify/static host):', backendErr);
+      }
+
+      setIsStandaloneMode(!isBackendOnline);
       stopRingbackTone();
       playCallChime(true);
 
@@ -645,13 +854,19 @@ export const LiveVoiceAssistant: React.FC<LiveVoiceAssistantProps> = () => {
       setIsInCall(true);
       setCallStatus('in-call');
       setSubtext(
-        stream
+        !isBackendOnline
+          ? 'Active Call • Browser Voice Engine (Netlify Static Host)'
+          : stream
           ? 'Active Live Phone Call • High Fidelity Audio'
           : 'Active Live Call • Speak or type below (Alex speaks back aloud)'
       );
 
       if (stream) {
-        setMicStatusMsg('Microphone: Active & Streaming 🟢');
+        setMicStatusMsg(
+          !isBackendOnline
+            ? 'Microphone: Browser Voice Recognition Active 🟢'
+            : 'Microphone: Active & Streaming 🟢'
+        );
         setMicStatusColor('text-emerald-400');
       } else {
         setMicStatusMsg('Microphone: Optional • Speak or type below');
@@ -684,6 +899,11 @@ export const LiveVoiceAssistant: React.FC<LiveVoiceAssistantProps> = () => {
       agentFinishedSpeakingTimeRef.current = Date.now();
       isAgentSpeakingRef.current = false;
       setAgentWaveState('off');
+
+      // On static hosts (Netlify), activate browser speech recognition so mic works directly
+      if (!isBackendOnline) {
+        startBrowserSpeechRecognition();
+      }
     } catch (err: any) {
       console.error('Call connection error:', err);
       stopRingbackTone();
@@ -700,6 +920,13 @@ export const LiveVoiceAssistant: React.FC<LiveVoiceAssistantProps> = () => {
     stopMediaRecordingAndSend();
     playCallChime(false);
     clearInterval(timerIntervalRef.current);
+
+    if (speechRecognitionRef.current) {
+      try {
+        speechRecognitionRef.current.abort();
+      } catch (e) {}
+      speechRecognitionRef.current = null;
+    }
 
     isAgentSpeakingRef.current = false;
     setAgentWaveState('off');
@@ -849,33 +1076,53 @@ export const LiveVoiceAssistant: React.FC<LiveVoiceAssistantProps> = () => {
 
         {/* Top Status Row */}
         <div className="flex justify-between items-center mb-5 flex-wrap gap-2.5">
-          <div
-            className={`inline-flex items-center gap-2 px-3.5 py-1.5 rounded-full text-xs sm:text-sm font-bold border transition-colors ${
-              callStatus === 'in-call'
-                ? 'bg-emerald-500/20 text-emerald-400 border-emerald-500/40'
-                : callStatus === 'ringing'
-                ? 'bg-amber-500/20 text-amber-300 border-amber-500/40 animate-pulse'
-                : 'bg-white/10 text-slate-300 border-white/15'
-            }`}
-          >
-            <span>
-              {callStatus === 'in-call' ? '🟢' : callStatus === 'ringing' ? '🟡' : '⚪'}
-            </span>
-            <span>
-              {callStatus === 'in-call'
-                ? 'In Call with Alex'
-                : callStatus === 'ringing'
-                ? 'Calling Alex...'
-                : callStatus === 'ended'
-                ? 'Call Ended'
-                : 'Ready to Call'}
-            </span>
+          <div className="flex items-center gap-2 flex-wrap">
+            <div
+              className={`inline-flex items-center gap-2 px-3.5 py-1.5 rounded-full text-xs sm:text-sm font-bold border transition-colors ${
+                callStatus === 'in-call'
+                  ? 'bg-emerald-500/20 text-emerald-400 border-emerald-500/40'
+                  : callStatus === 'ringing'
+                  ? 'bg-amber-500/20 text-amber-300 border-amber-500/40 animate-pulse'
+                  : 'bg-white/10 text-slate-300 border-white/15'
+              }`}
+            >
+              <span>
+                {callStatus === 'in-call' ? '🟢' : callStatus === 'ringing' ? '🟡' : '⚪'}
+              </span>
+              <span>
+                {callStatus === 'in-call'
+                  ? 'In Call with Alex'
+                  : callStatus === 'ringing'
+                  ? 'Calling Alex...'
+                  : callStatus === 'ended'
+                  ? 'Call Ended'
+                  : 'Ready to Call'}
+              </span>
+            </div>
+
+            {isStandaloneMode && (
+              <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold bg-sky-500/20 text-sky-300 border border-sky-500/30">
+                🌐 Browser Voice Engine
+              </span>
+            )}
           </div>
 
           <div className="font-mono font-bold text-base text-slate-400">
             {formatTimer(callTimerSecs)}
           </div>
         </div>
+
+        {isStandaloneMode && (
+          <div className="mb-4 px-3.5 py-2 rounded-xl bg-sky-950/40 border border-sky-500/30 text-xs text-sky-200 flex items-center justify-between gap-2">
+            <div className="flex items-center gap-2">
+              <span className="text-sm">🌐</span>
+              <span>
+                <strong>Static Host Active (Netlify):</strong> Alex is running using browser Web Speech & voice synthesis.
+              </span>
+            </div>
+            <span className="text-[11px] text-sky-400/80 hidden sm:inline">Web Speech API</span>
+          </div>
+        )}
 
         {/* Agent Avatar Row */}
         <div className="flex flex-col items-center text-center mb-4">
