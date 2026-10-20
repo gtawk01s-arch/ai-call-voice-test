@@ -79,6 +79,8 @@ export const LiveVoiceAssistant: React.FC<LiveVoiceAssistantProps> = () => {
   const vadSilenceTimeoutRef = useRef<any>(null);
   const isVadRecordingRef = useRef(false);
   const speechRecognitionRef = useRef<any>(null);
+  const speechSilenceTimeoutRef = useRef<any>(null);
+  const currentRecognizedTextRef = useRef<string>('');
   const agentFinishedSpeakingTimeRef = useRef<number>(0);
   const speechFrameCounterRef = useRef<number>(0);
 
@@ -307,12 +309,18 @@ export const LiveVoiceAssistant: React.FC<LiveVoiceAssistantProps> = () => {
     const clean = userText.trim();
     if (!clean) return;
 
+    if (speechSilenceTimeoutRef.current) {
+      clearTimeout(speechSilenceTimeoutRef.current);
+      speechSilenceTimeoutRef.current = null;
+    }
+    currentRecognizedTextRef.current = '';
+
     isCommittingTurnRef.current = true;
     setIsSending(true);
 
     if (speechRecognitionRef.current) {
       try {
-        speechRecognitionRef.current.stop();
+        speechRecognitionRef.current.abort();
       } catch (e) {}
     }
 
@@ -336,7 +344,7 @@ export const LiveVoiceAssistant: React.FC<LiveVoiceAssistantProps> = () => {
     setMessages((prev) => [...prev, userMsg]);
 
     setAgentWaveState('thinking');
-    setSubtext('Alex is thinking...');
+    setSubtext(`Alex is responding to: "${clean}"`);
 
     // Generate intelligent conversational answer in browser
     const engineRes = generateBrowserVoiceResponse(clean);
@@ -370,6 +378,8 @@ export const LiveVoiceAssistant: React.FC<LiveVoiceAssistantProps> = () => {
     isAgentSpeakingRef.current = true;
     setAgentWaveState('agent-speaking');
     setSubtext(`Alex: "${engineRes.response}"`);
+    setMicStatusMsg('🔊 Alex is speaking...');
+    setMicStatusColor('text-sky-400');
 
     await playVoiceAudio(engineRes.response, null, selectedVoice, isSpeakerOnRef.current);
 
@@ -377,6 +387,8 @@ export const LiveVoiceAssistant: React.FC<LiveVoiceAssistantProps> = () => {
     isAgentSpeakingRef.current = false;
     setAgentWaveState('off');
     setSubtext('Active Live Call • Alex is listening...');
+    setMicStatusMsg('Microphone: Listening for your voice... 🟢');
+    setMicStatusColor('text-emerald-400');
 
     if (engineRes.action === 'hangup') {
       setTimeout(() => {
@@ -385,12 +397,14 @@ export const LiveVoiceAssistant: React.FC<LiveVoiceAssistantProps> = () => {
       return;
     }
 
-    // Resume listening
-    if (isInCallRef.current && isStandaloneModeRef.current) {
-      try {
-        speechRecognitionRef.current?.start();
-      } catch (e) {}
-    }
+    // Resume listening after delay to avoid acoustic feedback
+    setTimeout(() => {
+      if (isInCallRef.current && isStandaloneModeRef.current && !isAgentSpeakingRef.current) {
+        try {
+          speechRecognitionRef.current?.start();
+        } catch (e) {}
+      }
+    }, 450);
   };
 
   // Start browser Web Speech Recognition for standalone static hosting
@@ -422,39 +436,78 @@ export const LiveVoiceAssistant: React.FC<LiveVoiceAssistantProps> = () => {
       };
 
       recognition.onresult = (event: any) => {
-        if (isAgentSpeakingRef.current || isCommittingTurnRef.current) return;
+        if (isAgentSpeakingRef.current) return;
 
         let interim = '';
         let final = '';
 
         for (let i = event.resultIndex; i < event.results.length; ++i) {
-          if (event.results[i].isFinal) {
-            final += event.results[i][0].transcript;
+          const item = event.results[i];
+          if (item.isFinal) {
+            final += item[0].transcript;
           } else {
-            interim += event.results[i][0].transcript;
+            interim += item[0].transcript;
           }
         }
 
-        if (interim.trim()) {
-          setAgentWaveState('caller-speaking');
-          setSubtext(`Listening: "${interim.trim()}"`);
-        }
+        const candidateText = (final || interim).trim();
 
-        if (final.trim()) {
-          console.log('Heard final speech via browser:', final.trim());
-          handleStandaloneUserTurn(final.trim());
+        if (candidateText) {
+          currentRecognizedTextRef.current = candidateText;
+          setAgentWaveState('caller-speaking');
+          setSubtext(`Heard: "${candidateText}"`);
+          setMicStatusMsg(`🎙️ Hearing you: "${candidateText}"`);
+          setMicStatusColor('text-emerald-400');
+
+          // Reset silence timeout whenever user continues speaking
+          if (speechSilenceTimeoutRef.current) {
+            clearTimeout(speechSilenceTimeoutRef.current);
+            speechSilenceTimeoutRef.current = null;
+          }
+
+          // If browser finalized the segment, send quickly (250ms).
+          // If interim (browser hasn't fired isFinal), send after 850ms pause!
+          const delayMs = final ? 250 : 850;
+
+          speechSilenceTimeoutRef.current = setTimeout(() => {
+            const textToSend = currentRecognizedTextRef.current.trim();
+            if (textToSend && !isAgentSpeakingRef.current && !isCommittingTurnRef.current) {
+              console.log('🚀 Sending voice transcript to AI:', textToSend);
+              currentRecognizedTextRef.current = '';
+              try { recognition.abort(); } catch (e) {}
+
+              if (isStandaloneModeRef.current) {
+                handleStandaloneUserTurn(textToSend);
+              } else {
+                commitUserTurn(textToSend);
+              }
+            }
+          }, delayMs);
         }
       };
 
       recognition.onerror = (event: any) => {
-        console.warn('Browser speech recognition error:', event.error);
+        console.warn('Browser speech recognition event:', event.error);
         if (event.error === 'not-allowed') {
           setErrorMessage('Microphone access was denied. Please allow microphone in browser site settings.');
         }
       };
 
       recognition.onend = () => {
-        if (isInCallRef.current && isStandaloneModeRef.current && !isAgentSpeakingRef.current) {
+        // If there was uncommitted speech in the buffer when recognition ended, commit it now!
+        const pending = currentRecognizedTextRef.current.trim();
+        if (pending && !isAgentSpeakingRef.current && !isCommittingTurnRef.current) {
+          currentRecognizedTextRef.current = '';
+          if (speechSilenceTimeoutRef.current) {
+            clearTimeout(speechSilenceTimeoutRef.current);
+            speechSilenceTimeoutRef.current = null;
+          }
+          if (isStandaloneModeRef.current) {
+            handleStandaloneUserTurn(pending);
+          } else {
+            commitUserTurn(pending);
+          }
+        } else if (isInCallRef.current && isStandaloneModeRef.current && !isAgentSpeakingRef.current) {
           try {
             recognition.start();
           } catch (e) {}
@@ -921,6 +974,12 @@ export const LiveVoiceAssistant: React.FC<LiveVoiceAssistantProps> = () => {
     playCallChime(false);
     clearInterval(timerIntervalRef.current);
 
+    if (speechSilenceTimeoutRef.current) {
+      clearTimeout(speechSilenceTimeoutRef.current);
+      speechSilenceTimeoutRef.current = null;
+    }
+    currentRecognizedTextRef.current = '';
+
     if (speechRecognitionRef.current) {
       try {
         speechRecognitionRef.current.abort();
@@ -1017,6 +1076,19 @@ export const LiveVoiceAssistant: React.FC<LiveVoiceAssistantProps> = () => {
     if (!activeMicStreamRef.current || !activeMicStreamRef.current.active) {
       const s = await initMicrophone(true);
       if (!s) return;
+    }
+
+    if (isStandaloneModeRef.current) {
+      const pending = currentRecognizedTextRef.current.trim();
+      if (pending) {
+        currentRecognizedTextRef.current = '';
+        if (speechSilenceTimeoutRef.current) {
+          clearTimeout(speechSilenceTimeoutRef.current);
+          speechSilenceTimeoutRef.current = null;
+        }
+        handleStandaloneUserTurn(pending);
+        return;
+      }
     }
 
     if (!isRecordingAudio) {
