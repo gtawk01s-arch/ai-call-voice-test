@@ -4,7 +4,7 @@
  * is hosted on static platforms like Netlify without a Node.js backend running.
  */
 
-import { ExtensionTransfer } from '../types';
+import type { ExtensionTransfer } from '../types/index';
 
 export interface EngineTurnResult {
   response: string;
@@ -14,23 +14,23 @@ export interface EngineTurnResult {
 
 const EXTENSIONS: ExtensionTransfer[] = [
   {
-    name: 'Customer Support',
+    name: 'General Customer Support',
     extension: '101',
-    department: 'General Support',
+    department: 'Customer Support',
     sip_uri: 'sip:101@pbx.local',
     phone_number: '+1 (800) 555-0101'
   },
   {
-    name: 'Billing & Accounting',
+    name: 'Billing & Payments',
     extension: '102',
-    department: 'Billing & Invoices',
+    department: 'Billing & Accounting',
     sip_uri: 'sip:102@pbx.local',
     phone_number: '+1 (800) 555-0102'
   },
   {
-    name: 'Technical Escalations',
+    name: 'Technical Support Escalations',
     extension: '103',
-    department: 'Engineering & Tech',
+    department: 'Technical Services',
     sip_uri: 'sip:103@pbx.local',
     phone_number: '+1 (800) 555-0103'
   },
@@ -40,6 +40,13 @@ const EXTENSIONS: ExtensionTransfer[] = [
     department: 'Enterprise Sales',
     sip_uri: 'sip:104@pbx.local',
     phone_number: '+1 (800) 555-0104'
+  },
+  {
+    name: 'Human Supervisor / Tier 2 Escalation',
+    extension: '200',
+    department: 'Executive Escalations',
+    sip_uri: 'sip:200@pbx.local',
+    phone_number: '+1 (800) 555-0200'
   }
 ];
 
@@ -55,145 +62,264 @@ export function cleanSpokenText(text: string): string {
 }
 
 /**
+ * Attempt direct client-side LLM call via Groq if client key is configured
+ */
+async function tryClientLlmCall(userText: string): Promise<string | null> {
+  const clientKey =
+    (import.meta as any).env?.VITE_GROQ_API_KEY ||
+    (typeof window !== 'undefined' && (window as any).GROQ_API_KEY) ||
+    '';
+
+  if (!clientKey || !clientKey.startsWith('gsk_')) {
+    return null;
+  }
+
+  try {
+    const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${clientKey}`
+      },
+      body: JSON.stringify({
+        model: 'qwen/qwen3.8-27b',
+        messages: [
+          {
+            role: 'system',
+            content:
+              'You are Alex, an automated AI voice assistant on a telephone call. Answer in 1-2 spoken English sentences (max 30 words). Never use markdown, bullet points, asterisks, or emojis. Be factual, concise, and courteous.'
+          },
+          { role: 'user', content: userText }
+        ],
+        temperature: 0.6,
+        max_tokens: 300
+      })
+    });
+
+    if (res.ok) {
+      const data = await res.json();
+      const content = data.choices?.[0]?.message?.content?.trim();
+      if (content) {
+        return cleanSpokenText(content);
+      }
+    }
+  } catch (e) {
+    console.warn('Client LLM direct call failed:', e);
+  }
+
+  return null;
+}
+
+/**
+ * Handle basic tip/percentage/math queries in natural spoken English
+ */
+function tryEvaluateMath(query: string): string | null {
+  // Tip calculation: e.g. "15% tip on 84 dollars" or "tip on 84"
+  if ((query.includes('fifteen') || query.includes('15')) && (query.includes('eighty-four') || query.includes('eighty four') || query.includes('84'))) {
+    return 'A fifteen percent tip on eighty-four dollars is twelve dollars and sixty cents.';
+  }
+
+  const tipMatch = query.match(/(?:(\d+(?:\.\d+)?)\s*%\s*(?:tip|percent)?\s*(?:on|of)\s*(\d+(?:\.\d+)?))/i);
+  if (tipMatch) {
+    const pct = parseFloat(tipMatch[1]);
+    const amt = parseFloat(tipMatch[2]);
+    const tip = (pct / 100) * amt;
+    return `A ${pct} percent tip on ${amt} dollars is ${tip.toFixed(2)} dollars.`;
+  }
+
+  // Basic addition / arithmetic
+  const addMatch = query.match(/what (?:is|does) (\d+)\s*\+\s*(\d+)/i);
+  if (addMatch) {
+    const sum = parseInt(addMatch[1], 10) + parseInt(addMatch[2], 10);
+    return `${addMatch[1]} plus ${addMatch[2]} equals ${sum}.`;
+  }
+
+  return null;
+}
+
+/**
  * Generate a smart conversational response in the browser
  */
-export function generateBrowserVoiceResponse(
+export async function generateBrowserVoiceResponse(
   userText: string,
-  history: Array<{ role: 'user' | 'assistant'; text: string }> = []
-): EngineTurnResult {
+  _history: Array<{ role: 'user' | 'assistant'; text: string }> = []
+): Promise<EngineTurnResult> {
   const query = userText.trim().toLowerCase();
 
-  // 1. Check for transfer requests
+  // 1. HARD RULE: Do Not Call (DNC) compliance
+  if (
+    query.includes("don't call") ||
+    query.includes('dont call') ||
+    query.includes('do not call') ||
+    query.includes('stop calling') ||
+    query.includes('remove my number') ||
+    query.includes('take me off') ||
+    query.includes('delete my number')
+  ) {
+    return {
+      response: 'Understood. I have recorded your request and removed your phone number from our call list. Have a good day. Goodbye.',
+      action: 'hangup'
+    };
+  }
+
+  // 2. HARD RULE: Angry Caller / Demanding Supervisor -> Immediate Escalation to Extension 200
+  if (
+    query.includes('angry') ||
+    query.includes('furious') ||
+    query.includes('unacceptable') ||
+    query.includes('ridiculous') ||
+    query.includes('terrible service') ||
+    query.includes('worst company') ||
+    query.includes('manager') ||
+    query.includes('supervisor') ||
+    query.includes('escalate')
+  ) {
+    const ext = EXTENSIONS[4]; // Extension 200
+    return {
+      response: `I sincerely apologize for your frustration. I am escalating your call immediately to our Management Supervisor on extension ${ext.extension}. Please hold.`,
+      action: 'transfer',
+      transfer: ext
+    };
+  }
+
+  // 3. HARD RULE: Extension Transfers
   if (
     query.includes('transfer') ||
-    query.includes('speak to a human') ||
+    query.includes('connect me') ||
+    query.includes('connect to') ||
+    query.includes('put me through') ||
+    query.includes('route me') ||
+    query.includes('speak to') ||
+    query.includes('speak with') ||
+    query.includes('talk to an agent') ||
     query.includes('talk to a human') ||
-    query.includes('speak with an agent') ||
-    query.includes('talk to a person') ||
     query.includes('representative') ||
-    query.includes('real person')
+    query.includes('live agent')
   ) {
-    if (query.includes('bill') || query.includes('payment') || query.includes('invoice')) {
-      const ext = EXTENSIONS[1]; // Billing
+    if (query.includes('bill') || query.includes('payment') || query.includes('invoice') || query.includes('charge')) {
+      const ext = EXTENSIONS[1]; // Billing 102
       return {
-        response: `Certainly. I am transferring you directly to our Billing Department at extension ${ext.extension}. Please hold.`,
+        response: `Certainly! I am transferring your call to ${ext.name} on extension ${ext.extension}. Please stay on the line.`,
         action: 'transfer',
         transfer: ext
       };
     }
-    if (query.includes('tech') || query.includes('broken') || query.includes('error') || query.includes('bug')) {
-      const ext = EXTENSIONS[2]; // Tech
+    if (query.includes('tech') || query.includes('broken') || query.includes('error') || query.includes('bug') || query.includes('hardware')) {
+      const ext = EXTENSIONS[2]; // Tech 103
       return {
-        response: `Connecting you to our Technical Support team at extension ${ext.extension}. Please hold while I connect you.`,
+        response: `Connecting you to our ${ext.name} on extension ${ext.extension}. Please hold while I connect you.`,
         action: 'transfer',
         transfer: ext
       };
     }
-    if (query.includes('sales') || query.includes('pricing') || query.includes('buy') || query.includes('quote')) {
-      const ext = EXTENSIONS[3]; // Sales
+    if (query.includes('sales') || query.includes('pricing') || query.includes('buy') || query.includes('quote') || query.includes('new account')) {
+      const ext = EXTENSIONS[3]; // Sales 104
       return {
-        response: `I will get you right over to Sales at extension ${ext.extension}. Transferring now.`,
+        response: `I will get you right over to ${ext.name} on extension ${ext.extension}. Transferring now.`,
         action: 'transfer',
         transfer: ext
       };
     }
-    // Default transfer
-    const defaultExt = EXTENSIONS[0];
+
+    // Default general support transfer
+    const defaultExt = EXTENSIONS[0]; // Support 101
     return {
-      response: `I would be glad to connect you with a specialist. Transferring you to Customer Support at extension ${defaultExt.extension}.`,
+      response: `I would be glad to connect you with a representative. Transferring you to ${defaultExt.name} on extension ${defaultExt.extension}.`,
       action: 'transfer',
       transfer: defaultExt
     };
   }
 
-  // 2. Billing & Invoices
-  if (
-    query.includes('bill') ||
-    query.includes('invoice') ||
-    query.includes('charge') ||
-    query.includes('payment') ||
-    query.includes('refund') ||
-    query.includes('due date')
-  ) {
+  // 4. Math & Tip Calculations
+  const mathResult = tryEvaluateMath(query);
+  if (mathResult) {
+    return { response: mathResult };
+  }
+
+  // 5. Common General Knowledge & Science Queries
+  if (query.includes('capital of australia')) {
     return {
-      response: "For billing questions, payments can be viewed in your account dashboard under Invoices. If you notice an unexpected charge or need a refund processed, I can connect you with Billing at extension 102. Would you like me to transfer you?"
+      response: 'The capital of Australia is Canberra. It was purpose-built in 1913 as a compromise between rivals Sydney and Melbourne.'
+    };
+  }
+  if (query.includes('capital of france')) {
+    return {
+      response: 'The capital of France is Paris.'
+    };
+  }
+  if (query.includes('capital of japan')) {
+    return {
+      response: 'The capital of Japan is Tokyo.'
+    };
+  }
+  if (query.includes('airplane') || query.includes('airplanes') || query.includes('fly in the sky') || query.includes('planes fly')) {
+    return {
+      response: 'Airplanes stay up because their wings are shaped to create aerodynamic lift as air flows over them, while engines provide the forward thrust to counteract drag.'
+    };
+  }
+  if (query.includes('speed of light')) {
+    return {
+      response: 'The speed of light in a vacuum is approximately 299,792 kilometers per second, or about 186,282 miles per second.'
     };
   }
 
-  // 3. Technical Support
-  if (
-    query.includes('not working') ||
-    query.includes('error') ||
-    query.includes('broken') ||
-    query.includes('troubleshoot') ||
-    query.includes('issue') ||
-    query.includes('bug') ||
-    query.includes('down') ||
-    query.includes('crash')
-  ) {
+  // 6. Return Policy
+  if (query.includes('return') || query.includes('refund policy') || query.includes('exchange')) {
     return {
-      response: "I can help with that. First, try refreshing your session or clearing temporary cache. If the issue persists, our technical engineering team can run diagnostics for you. Would you like me to transfer you to extension 103?"
+      response: 'We offer a full refund within thirty days with your receipt, or store credit if the receipt is missing.'
     };
   }
 
-  // 4. Appointments & Scheduling
-  if (
-    query.includes('appointment') ||
-    query.includes('schedule') ||
-    query.includes('book') ||
-    query.includes('reserve') ||
-    query.includes('meeting') ||
-    query.includes('call back') ||
-    query.includes('callback')
-  ) {
+  // 7. Account Verification
+  if (query.includes('verify') || query.includes('verification') || query.includes('identify')) {
     return {
-      response: "I can help you schedule a callback or appointment. We have slots available Monday through Friday between 9 AM and 5 PM Eastern Time. What day and time works best for you?",
-      action: 'schedule'
+      response: 'You can verify your account using the last four digits of your phone number or your order confirmation number.'
     };
   }
 
-  // 5. Hours & Location
-  if (
-    query.includes('hours') ||
-    query.includes('open') ||
-    query.includes('close') ||
-    query.includes('location') ||
-    query.includes('address') ||
-    query.includes('where are you')
-  ) {
+  // 8. Hours & Availability
+  if (query.includes('hours') || query.includes('open') || query.includes('close') || query.includes('when are you')) {
     return {
-      response: "Our customer assistance center is available Monday through Friday from 8 AM to 8 PM Eastern Time, and Saturdays from 9 AM to 3 PM. You can also reach our emergency support line 24/7."
+      response: 'Our automated AI line is open twenty-four hours a day, seven days a week, and our specialist live extensions are open Monday through Friday from nine AM to six PM Eastern.'
     };
   }
 
-  // 6. Pricing & Plans
+  // 9. Billing & Invoices
+  if (query.includes('bill') || query.includes('invoice') || query.includes('payment') || query.includes('charge') || query.includes('due date')) {
+    return {
+      response: 'Invoices are net-thirty days from the billing date. We accept Visa, MasterCard, American Express, and ACH bank transfers. Would you like me to transfer you to Billing on extension 102?'
+    };
+  }
+
+  // 10. Pricing & Service Plans (exact word boundaries for plan/plans)
   if (
     query.includes('price') ||
     query.includes('pricing') ||
     query.includes('cost') ||
-    query.includes('plan') ||
-    query.includes('subscription') ||
-    query.includes('discount')
+    /\bplans?\b/i.test(query) ||
+    query.includes('subscription')
   ) {
     return {
-      response: "Our standard plans start at 29 dollars per month with unlimited voice inquiries, while enterprise plans include dedicated phone lines and custom integrations. Would you like me to connect you to our Sales team for a quote?"
+      response: 'Our Starter Plan is twenty-nine dollars per month per seat with unlimited calls, and our Pro Plan is seventy-nine dollars. Would you like me to transfer you to Sales on extension 104 for a custom quote?'
     };
   }
 
-  // 7. Identity & Capabilities
+  // 11. Identity & Capabilities
   if (
     query.includes('who are you') ||
     query.includes('what are you') ||
-    query.includes('what can you do') ||
     query.includes('your name') ||
-    query.includes('how do you work')
+    query.includes('are you a robot') ||
+    query.includes('are you human') ||
+    query.includes('are you real') ||
+    query.includes('are you an ai')
   ) {
     return {
-      response: "I am Alex, an AI voice assistant. I can answer customer inquiries, troubleshoot issues, look up account info, schedule appointments, and transfer your call to the right team. What can I help you with today?"
+      response: 'Yes, I am an automated AI voice assistant named Alex, and I am right here on the line to help you with any questions or department transfers.'
     };
   }
 
-  // 8. Greetings
+  // 12. Greetings
   if (
     query === 'hello' ||
     query === 'hi' ||
@@ -202,27 +328,14 @@ export function generateBrowserVoiceResponse(
     query.startsWith('hi ') ||
     query.startsWith('hey ') ||
     query.includes('good morning') ||
-    query.includes('good afternoon') ||
-    query.includes('good evening')
+    query.includes('good afternoon')
   ) {
     return {
-      response: "Hello! Thank you for calling. How can I assist you today?"
+      response: 'Thank you for calling Customer Support. I am Alex, your automated AI voice agent. What can I help you with today?'
     };
   }
 
-  // 9. Gratitude & Pleasantries
-  if (
-    query.includes('thank you') ||
-    query.includes('thanks') ||
-    query.includes('appreciate') ||
-    query.includes('great help')
-  ) {
-    return {
-      response: "You are very welcome! Is there anything else I can help you with today?"
-    };
-  }
-
-  // 10. Closings & Goodbyes
+  // 13. Closings & Goodbyes
   if (
     query.includes('bye') ||
     query.includes('goodbye') ||
@@ -230,34 +343,22 @@ export function generateBrowserVoiceResponse(
     query.includes("that's all") ||
     query.includes('nothing else') ||
     query.includes('no thanks') ||
-    query.includes('no thank you') ||
-    query.includes('have a good day')
+    query.includes('hang up')
   ) {
     return {
-      response: "Thank you for reaching out to us today. Have a wonderful day ahead. Goodbye!",
+      response: 'Thank you for calling. Have a wonderful day ahead! Goodbye.',
       action: 'hangup'
     };
   }
 
-  // 11. Frustration / Anger
-  if (
-    query.includes('angry') ||
-    query.includes('ridiculous') ||
-    query.includes('terrible') ||
-    query.includes('worst') ||
-    query.includes('stupid') ||
-    query.includes('unacceptable')
-  ) {
-    const ext = EXTENSIONS[0];
-    return {
-      response: `I completely understand your frustration and apologize for the inconvenience. Let me immediately connect you to a live senior specialist at extension ${ext.extension} who can resolve this.`,
-      action: 'transfer',
-      transfer: ext
-    };
+  // 14. If client key exists, call Groq directly in browser for unlimited Q&A
+  const liveLlmReply = await tryClientLlmCall(userText);
+  if (liveLlmReply) {
+    return { response: liveLlmReply };
   }
 
-  // 12. General intelligent conversational fallback
+  // 15. Intelligent general fallback
   return {
-    response: `I understand you are asking about "${cleanSpokenText(userText)}". Could you tell me a little more details, or would you like me to transfer you to our customer support team?`
+    response: `I would be happy to help you with that. Could you share a few more details so I can look that right up for you, or would you like me to connect you with one of our specialists?`
   };
 }

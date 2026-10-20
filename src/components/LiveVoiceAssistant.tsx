@@ -347,7 +347,7 @@ export const LiveVoiceAssistant: React.FC<LiveVoiceAssistantProps> = () => {
     setSubtext(`Alex is responding to: "${clean}"`);
 
     // Generate intelligent conversational answer in browser
-    const engineRes = generateBrowserVoiceResponse(clean);
+    const engineRes = await generateBrowserVoiceResponse(clean);
 
     const botMsg: MessageItem = {
       id: `bot-${Date.now()}`,
@@ -818,7 +818,7 @@ export const LiveVoiceAssistant: React.FC<LiveVoiceAssistantProps> = () => {
     } catch (err: any) {
       console.warn('Backend turn error, answering via browser engine:', err);
       setIsStandaloneMode(true);
-      const engineRes = generateBrowserVoiceResponse(clean);
+      const engineRes = await generateBrowserVoiceResponse(clean);
       const botMsg: MessageItem = {
         id: `bot-${Date.now()}`,
         type: 'bot',
